@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "betwixt"
+version = "0.1.0"
+description = "Seamless feature-wise audio morphing with no time-stretching"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Colby Leider", email = "colby@leider.org" }]
+keywords = ["audio", "dsp", "morphing", "sound-design", "spectral"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Multimedia :: Sound/Audio :: Conversion",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "soundfile>=0.12",
+]
+
+[project.optional-dependencies]
+neural = [
+    "torch>=2.2",
+    "torchaudio>=2.2",
+    "descript-audio-codec>=1.0",
+    "torchcrepe>=0.0.23",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+betwixt = "betwixt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 79
+target-version = "py310"

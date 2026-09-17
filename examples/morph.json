@@ -1,0 +1,11 @@
+{
+  "default": { "curve": "scurve", "steepness": 4.0 },
+
+  "rhythm":    { "mode": "dissolve", "curve": "exp", "rate": 2.5,
+                 "start": 0.0, "end": 0.7 },
+  "f0":        { "curve": "linear", "start": 0.3, "end": 1.0 },
+  "harmonics": { "curve": "scurve", "steepness": 3.0 },
+  "snr":       { "curve": "log", "rate": 2.0 },
+  "centroid":  { "curve": "cosine" },
+  "loudness":  { "curve": "linear" }
+}
