@@ -87,21 +87,52 @@ def render(plan: MorphPlan) -> np.ndarray:
     # ------------------------------------------------------------------
     # Steps 4–6: Build per-stream alpha schedules
     #
-    # Feature extraction and perceptual uniformity are not yet implemented.
-    # The pipeline falls back to evaluating each stream's curve directly on
-    # a linear time axis (equivalent to --no-perceptual).  When
-    # perceptual.uniformity.solve_uniform_schedule is implemented, the
-    # solved schedule is interposed here as a warp of the t axis before
-    # curve evaluation.
+    # First solve for a perceptual uniformity schedule (unless disabled),
+    # then evaluate each stream's curve through that schedule so that
+    # 'linear' means perceptually linear.
     # ------------------------------------------------------------------
     hop = 512  # must match SpectralEngine._hop
     n_out_frames = 1 + out_samples // hop
+
+    schedule = None
+    if plan.perceptual:
+        from .perceptual.uniformity import solve_uniform_schedule, apply_schedule
+
+        def _probe_render(alpha_val: float) -> np.ndarray:
+            """Quick low-res render at a single alpha for uniformity probing."""
+            probe_alphas = {name: np.array([alpha_val])
+                           for name, sp in plan.streams.items() if sp.enabled}
+            probe_engine = _get_engine(route.engine)
+            # Use a short segment (first 2 seconds) to keep probing fast
+            max_probe = min(sr_out * 2, out_samples)
+            probe_req = MorphRequest(
+                a=xa, b=xb, sample_rate=sr_out, out_samples=max_probe,
+                alphas=probe_alphas, rhythm_mode=route.rhythm_mode,
+                tail=plan.tail, hold_others=plan.hold_others,
+                device=plan.device,
+            )
+            return probe_engine.render(probe_req)
+
+        if not plan.quiet:
+            print("solving perceptual uniformity ...")
+        try:
+            schedule = solve_uniform_schedule(
+                _probe_render, n_points=16, sr=sr_out, device=plan.device)
+        except Exception as e:
+            import warnings
+            warnings.warn(f"perceptual uniformity failed ({e}); using linear",
+                          stacklevel=2)
+            schedule = None
 
     alphas: dict[str, np.ndarray] = {}
     t = np.linspace(0.0, 1.0, n_out_frames)
     for name, sp in plan.streams.items():
         if sp.enabled:
-            alphas[name] = sp.curve(t)
+            raw = sp.curve(t)
+            if schedule is not None:
+                from .perceptual.uniformity import apply_schedule
+                raw = apply_schedule(schedule, raw)
+            alphas[name] = raw
 
     # ------------------------------------------------------------------
     # Step 7: Render
@@ -136,11 +167,42 @@ def render(plan: MorphPlan) -> np.ndarray:
         print(f"wrote {plan.output}")
 
     # ------------------------------------------------------------------
-    # Step 9: Report (not yet implemented)
+    # Step 9: Report — score the morph on perceptual metrics
     # ------------------------------------------------------------------
     if plan.report:
-        import warnings
-        warnings.warn("--report is not yet implemented; skipping", stacklevel=2)
+        import json as _json
+        from .perceptual.metrics import evaluate as eval_metrics
+
+        if not plan.quiet:
+            print("scoring morph quality ...")
+
+        # Render probe points across the morph
+        n_probe = 9
+        probe_renders = []
+        probe_engine = _get_engine(route.engine)
+        for i in range(n_probe):
+            alpha_val = i / (n_probe - 1)
+            probe_alphas = {name: np.array([alpha_val])
+                           for name, sp in plan.streams.items() if sp.enabled}
+            max_probe = min(sr_out * 2, out_samples)
+            probe_req = MorphRequest(
+                a=xa, b=xb, sample_rate=sr_out, out_samples=max_probe,
+                alphas=probe_alphas, rhythm_mode=route.rhythm_mode,
+                tail=plan.tail, hold_others=plan.hold_others,
+                device=plan.device,
+            )
+            probe_renders.append(probe_engine.render(probe_req))
+
+        metrics = eval_metrics(probe_renders, sr_out, plan.device)
+        report_path = plan.report
+        with open(report_path, "w") as f:
+            _json.dump(metrics.as_dict(), f, indent=2)
+
+        if not plan.quiet:
+            print(f"report: correspondence={metrics.correspondence:.3f}"
+                  f"  smoothness={metrics.smoothness:.3f}"
+                  f"  detectability={metrics.detectability:.3f}")
+            print(f"wrote {report_path}")
 
     return y
 

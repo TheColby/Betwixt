@@ -153,6 +153,9 @@ def _cepstral_envelope(log_mag: np.ndarray, n_coeff: int = 32) -> np.ndarray:
 class SpectralEngine(MorphEngine):
     """STFT-based morph via phase-vocoder interpolation.
 
+    Harmonic and percussive components are separated via HPSS before morphing
+    so that transients and sustained tones each receive appropriate treatment.
+
     Envelope and fine structure are separated before morphing so that
     formant peaks shift toward their counterparts in B independently of
     the harmonic fine structure.  Instantaneous frequencies are
@@ -206,9 +209,10 @@ class SpectralEngine(MorphEngine):
         # Separate stream alphas:
         #   centroid → how much the spectral envelope (formant shape) morphs
         #   harmonics → how much the harmonic fine structure morphs
-        # If neither stream is active, both default to the global alpha.
+        #   transient → how much percussive component morphs (via snr or dedicated)
         env_alpha   = _stream_alpha("centroid",  alpha)   # envelope / formants
         fine_alpha  = _stream_alpha("harmonics", alpha)   # fine structure / pitch
+        perc_alpha  = _stream_alpha("snr", alpha)         # percussive blend
 
         t_out = np.linspace(0.0, 1.0, max(n_out_frames, 1))
 
@@ -220,23 +224,15 @@ class SpectralEngine(MorphEngine):
             b_ch = req.b[min(ch, req.b.shape[0] - 1)].astype(np.float32)
 
             # --- STFT (center=True: zero-padded, perfect reconstruction) ---
-            A = librosa.stft(a_ch, n_fft=n_fft, hop_length=hop, center=True)
-            B = librosa.stft(b_ch, n_fft=n_fft, hop_length=hop, center=True)
+            A_full = librosa.stft(a_ch, n_fft=n_fft, hop_length=hop, center=True)
+            B_full = librosa.stft(b_ch, n_fft=n_fft, hop_length=hop, center=True)
 
-            n_frames_a = A.shape[1]
-            n_frames_b = B.shape[1]
+            # --- HPSS: separate harmonic and percussive components ---
+            A_h, A_p = librosa.decompose.hpss(A_full)
+            B_h, B_p = librosa.decompose.hpss(B_full)
 
-            # --- Phase-vocoder analysis ---
-            mag_A, if_A = _pv_analysis(A, hop, req.sample_rate)
-            mag_B, if_B = _pv_analysis(B, hop, req.sample_rate)
-
-            # --- Cepstral envelope separation ---
-            log_mag_A = np.log(mag_A + eps)  # (bins, n_frames_a)
-            log_mag_B = np.log(mag_B + eps)
-            env_A = _cepstral_envelope(log_mag_A, n_coeff)
-            env_B = _cepstral_envelope(log_mag_B, n_coeff)
-            res_A = log_mag_A - env_A   # fine (harmonic) structure
-            res_B = log_mag_B - env_B
+            n_frames_a = A_full.shape[1]
+            n_frames_b = B_full.shape[1]
 
             # --- Frame indices & tail policy ---
             fa_raw = t_out * (n_frames_a - 1)
@@ -246,45 +242,72 @@ class SpectralEngine(MorphEngine):
             fa = _tail_indices(fa_raw, n_frames_a, req.tail)
             fb = _tail_indices(fb_raw, n_frames_b, req.tail)
 
-            a_bc     = eff_alpha[np.newaxis, :]              # (1, n_out) – global
-            env_a_bc = env_alpha[np.newaxis, :]              # formant alpha
-            fine_a_bc = fine_alpha[np.newaxis, :]            # fine-structure alpha
+            # ============================================================
+            # Harmonic component: PV + cepstral envelope morph
+            # ============================================================
+            mag_A, if_A = _pv_analysis(A_h, hop, req.sample_rate)
+            mag_B, if_B = _pv_analysis(B_h, hop, req.sample_rate)
 
-            # --- Gather all arrays at output positions ---
-            env_A_g = _gather(env_A, fa)  # (bins, n_out)
+            log_mag_A = np.log(mag_A + eps)
+            log_mag_B = np.log(mag_B + eps)
+            env_A = _cepstral_envelope(log_mag_A, n_coeff)
+            env_B = _cepstral_envelope(log_mag_B, n_coeff)
+            res_A = log_mag_A - env_A
+            res_B = log_mag_B - env_B
+
+            a_bc      = eff_alpha[np.newaxis, :]
+            env_a_bc  = env_alpha[np.newaxis, :]
+            fine_a_bc = fine_alpha[np.newaxis, :]
+            perc_a_bc = perc_alpha[np.newaxis, :]
+
+            env_A_g = _gather(env_A, fa)
             env_B_g = _gather(env_B, fb)
             res_A_g = _gather(res_A, fa)
             res_B_g = _gather(res_B, fb)
             if_A_g  = _gather(if_A,  fa)
             if_B_g  = _gather(if_B,  fb)
 
-            # Initial-phase frames (integer nearest to fa[0] / fb[0])
-            phase_A0 = np.angle(A[:, int(round(float(fa[0])))])
-            phase_B0 = np.angle(B[:, int(round(float(fb[0])))])
+            phase_A0 = np.angle(A_h[:, int(round(float(fa[0])))])
+            phase_B0 = np.angle(B_h[:, int(round(float(fb[0])))])
 
-            # --- Morph: envelope and fine structure use independent alphas ---
-            # centroid stream → how much the spectral envelope (formants) shifts
-            # harmonics stream → how much the harmonic fine structure shifts
             env_m = (1.0 - env_a_bc)  * env_A_g + env_a_bc  * env_B_g
             res_m = (1.0 - fine_a_bc) * res_A_g + fine_a_bc * res_B_g
-            mag_m = np.exp(env_m + res_m).astype(np.float32)  # (bins, n_out)
+            mag_m = np.exp(env_m + res_m).astype(np.float32)
 
             if_m  = ((1.0 - a_bc) * if_A_g  + a_bc * if_B_g).astype(np.float64)
 
-            # --- Phase synthesis: integrate morphed IFs from blended initial ---
             a0 = float(eff_alpha[0])
-            phase_0 = (1.0 - a0) * phase_A0 + a0 * phase_B0  # (bins,)
+            phase_0 = (1.0 - a0) * phase_A0 + a0 * phase_B0
 
-            # delta_phi[k, i] = 2π * IF_m[k, i] * hop / sr
             d_phi = 2.0 * np.pi * if_m * hop / req.sample_rate
-
-            # Integrate: phase[:, 0] = phase_0,
-            #            phase[:, i] = phase_0 + sum_{j=1}^{i} d_phi[:, j]
             cum = np.zeros_like(d_phi)
             cum[:, 1:] = np.cumsum(d_phi[:, 1:], axis=1)
             phase_m = phase_0[:, np.newaxis] + cum
 
-            out_stft = (mag_m * np.exp(1j * phase_m)).astype(np.complex64)
+            harmonic_stft = (mag_m * np.exp(1j * phase_m)).astype(np.complex64)
+
+            # ============================================================
+            # Percussive component: magnitude blend with phase selection
+            # ============================================================
+            A_p_g = _gather(A_p, fa)
+            B_p_g = _gather(B_p, fb)
+
+            mag_Ap = np.abs(A_p_g)
+            mag_Bp = np.abs(B_p_g)
+            mag_perc = ((1.0 - perc_a_bc) * mag_Ap +
+                        perc_a_bc * mag_Bp).astype(np.float32)
+
+            # Phase: pick from whichever source dominates at each bin/frame
+            phase_Ap = np.angle(A_p_g)
+            phase_Bp = np.angle(B_p_g)
+            phase_perc = np.where(perc_a_bc < 0.5, phase_Ap, phase_Bp)
+
+            perc_stft = (mag_perc * np.exp(1j * phase_perc)).astype(np.complex64)
+
+            # ============================================================
+            # Recombine and synthesize
+            # ============================================================
+            out_stft = harmonic_stft + perc_stft
 
             y_ch = librosa.istft(out_stft, hop_length=hop,
                                  center=True, length=req.out_samples)
