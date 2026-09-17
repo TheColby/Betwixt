@@ -184,15 +184,31 @@ class SpectralEngine(MorphEngine):
         if not relevant:
             relevant = req.alphas
 
+        t_out = np.linspace(0.0, 1.0, n_out_frames)
+
+        def _stream_alpha(name: str, fallback: np.ndarray) -> np.ndarray:
+            """Return per-frame alpha for a named stream, or fallback."""
+            v = req.alphas.get(name)
+            if v is not None and len(v) > 0:
+                t_s = np.linspace(0.0, 1.0, max(len(v), 1))
+                return np.interp(t_out, t_s, v)
+            return fallback
+
         if relevant:
-            t_out = np.linspace(0.0, 1.0, n_out_frames)
             resampled = []
             for v in relevant.values():
                 t_src = np.linspace(0.0, 1.0, max(len(v), 1))
                 resampled.append(np.interp(t_out, t_src, v))
             alpha = np.mean(resampled, axis=0).astype(np.float64)
         else:
-            alpha = np.linspace(0.0, 1.0, n_out_frames)
+            alpha = t_out.copy()
+
+        # Separate stream alphas:
+        #   centroid → how much the spectral envelope (formant shape) morphs
+        #   harmonics → how much the harmonic fine structure morphs
+        # If neither stream is active, both default to the global alpha.
+        env_alpha   = _stream_alpha("centroid",  alpha)   # envelope / formants
+        fine_alpha  = _stream_alpha("harmonics", alpha)   # fine structure / pitch
 
         t_out = np.linspace(0.0, 1.0, max(n_out_frames, 1))
 
@@ -230,7 +246,9 @@ class SpectralEngine(MorphEngine):
             fa = _tail_indices(fa_raw, n_frames_a, req.tail)
             fb = _tail_indices(fb_raw, n_frames_b, req.tail)
 
-            a_bc = eff_alpha[np.newaxis, :]  # (1, n_out)
+            a_bc     = eff_alpha[np.newaxis, :]              # (1, n_out) – global
+            env_a_bc = env_alpha[np.newaxis, :]              # formant alpha
+            fine_a_bc = fine_alpha[np.newaxis, :]            # fine-structure alpha
 
             # --- Gather all arrays at output positions ---
             env_A_g = _gather(env_A, fa)  # (bins, n_out)
@@ -244,9 +262,11 @@ class SpectralEngine(MorphEngine):
             phase_A0 = np.angle(A[:, int(round(float(fa[0])))])
             phase_B0 = np.angle(B[:, int(round(float(fb[0])))])
 
-            # --- Morph envelope, fine structure, and instantaneous frequency ---
-            env_m = (1.0 - a_bc) * env_A_g + a_bc * env_B_g
-            res_m = (1.0 - a_bc) * res_A_g + a_bc * res_B_g
+            # --- Morph: envelope and fine structure use independent alphas ---
+            # centroid stream → how much the spectral envelope (formants) shifts
+            # harmonics stream → how much the harmonic fine structure shifts
+            env_m = (1.0 - env_a_bc)  * env_A_g + env_a_bc  * env_B_g
+            res_m = (1.0 - fine_a_bc) * res_A_g + fine_a_bc * res_B_g
             mag_m = np.exp(env_m + res_m).astype(np.float32)  # (bins, n_out)
 
             if_m  = ((1.0 - a_bc) * if_A_g  + a_bc * if_B_g).astype(np.float64)

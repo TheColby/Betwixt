@@ -147,9 +147,11 @@ def render(plan: MorphPlan) -> np.ndarray:
 
 def _get_engine(name: str):
     from .engines.spectral import SpectralEngine
+    from .engines.sinusoidal import SinusoidalEngine
 
     registry = {
         "spectral": SpectralEngine,
+        "sinusoidal": SinusoidalEngine,
     }
     cls = registry.get(name)
     if cls is None:
